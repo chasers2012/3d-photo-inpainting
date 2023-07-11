@@ -835,6 +835,15 @@ def clean_far_edge(mask_edge, mask_edge_with_id, context_edge, mask, info_on_pix
 
     return far_edge, uncleaned_far_edge, far_edge_with_id, near_edge_with_id
 
+def get_sbs_eye_pos():
+    tgt_poses = []
+    generic_pose = np.eye(4)
+    sx, sy, sz = np.array([0.0065, 0.0 ]), np.array([0.0, 0.0]), np.array([0.0, 0.0])
+    for xx, yy, zz in zip(sx, sy, sz):
+        tgt_poses.append(generic_pose * 1.)
+        tgt_poses[-1][:3, -1] = np.array([xx, yy, zz])
+    return tgt_poses
+
 def get_MiDaS_samples(image_folder, depth_folder, config, specific=None, aft_certain=None):
     lines = [os.path.splitext(os.path.basename(xx))[0] for xx in glob.glob(os.path.join(image_folder, '*' + config['img_format']))]
     samples = []

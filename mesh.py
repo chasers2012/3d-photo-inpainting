@@ -16,7 +16,7 @@ import time
 import copy
 import torch
 import os
-from utils import path_planning, open_small_mask, clean_far_edge, refine_depth_around_edge
+from utils import get_sbs_eye_pos, path_planning, open_small_mask, clean_far_edge, refine_depth_around_edge
 from utils import refine_color_around_edge, filter_irrelevant_edge_new, require_depth_edge, clean_far_edge_new
 from utils import create_placeholder, refresh_node, find_largest_rect
 from mesh_tools import get_depth_from_maps, get_map_from_ccs, get_edge_from_nodes, get_depth_from_nodes, get_rgb_from_nodes, crop_maps_by_size, convert2tensor, recursive_add_edge, update_info, filter_edge, relabel_node, depth_inpainting
@@ -2119,7 +2119,6 @@ def read_ply(mesh_fi):
 
     return verts, colors, faces, Height, Width, hFov, vFov
 
-
 class Canvas_view():
     def __init__(self,
                  fov,
@@ -2162,6 +2161,46 @@ class Canvas_view():
     def reinit_camera(self, fov):
         self.view.camera.fov = fov
         self.view.camera.view_changed()
+
+class Translate(object):
+    
+    def __init__(self, normal_canvas, rel_pose, fov):
+        axis, angle = transforms3d.axangles.mat2axangle(rel_pose[0:3, 0:3])
+        self.normal_canvas=normal_canvas
+        self.rel_pose=rel_pose
+        self.axis=axis
+        self.angle=(angle*180)/np.pi
+        self.fov=fov
+
+    def __enter__(self):
+        self.normal_canvas.rotate(axis=self.axis, angle=self.angle)
+        self.normal_canvas.translate(self.rel_pose[:3,3])
+        self.normal_canvas.reinit_camera(self.fov)
+        self.normal_canvas.view_changed()
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb):
+        self.normal_canvas.translate(-self.rel_pose[:3,3])
+        self.normal_canvas.rotate(axis=self.axis, angle=-self.angle)
+        self.normal_canvas.view_changed()
+
+def render_frame(normal_canvas, rel_pose, fov, init_factor, anchor, border, config):
+    with Translate(normal_canvas, rel_pose, fov):
+        img = normal_canvas.render()
+        img = cv2.GaussianBlur(img,(int(init_factor//2 * 2 + 1), int(init_factor//2 * 2 + 1)), 0)
+        img = cv2.resize(img, (int(img.shape[1] / init_factor), int(img.shape[0] / init_factor)), interpolation=cv2.INTER_AREA)
+        img = img[anchor[0]:anchor[1], anchor[2]:anchor[3]]
+        img = img[int(border[0]):int(border[1]), int(border[2]):int(border[3])]
+
+        if any(np.array(config['crop_border']) > 0.0):
+            H_c, W_c, _ = img.shape
+            o_t = int(H_c * config['crop_border'][0])
+            o_l = int(W_c * config['crop_border'][1])
+            o_b = int(H_c * config['crop_border'][2])
+            o_r = int(W_c * config['crop_border'][3])
+            img = img[o_t:H_c-o_b, o_l:W_c-o_r]
+            img = cv2.resize(img, (W_c, H_c), interpolation=cv2.INTER_CUBIC)
+    return img
 
 
 def output_3d_photo(verts, colors, faces, Height, Width, hFov, vFov, tgt_poses, video_traj_types, ref_pose,
@@ -2230,66 +2269,45 @@ def output_3d_photo(verts, colors, faces, Height, Width, hFov, vFov, tgt_poses, 
                   img.shape[1]]
     anchor = np.array(anchor)
     plane_width = np.tan(fov_in_rad/2.) * np.abs(mean_loc_depth)
-    for video_pose, video_traj_type in zip(videos_poses, video_traj_types):
-        stereos = []
-        tops = []; buttoms = []; lefts = []; rights = []
-        for tp_id, tp in enumerate(video_pose):
-            rel_pose = np.linalg.inv(np.dot(tp, np.linalg.inv(ref_pose)))
-            axis, angle = transforms3d.axangles.mat2axangle(rel_pose[0:3, 0:3])
-            normal_canvas.rotate(axis=axis, angle=(angle*180)/np.pi)
-            normal_canvas.translate(rel_pose[:3,3])
-            new_mean_loc_depth = mean_loc_depth - float(rel_pose[2, 3])
-            if 'dolly' in video_traj_type:
-                new_fov = float((np.arctan2(plane_width, np.array([np.abs(new_mean_loc_depth)])) * 180. / np.pi) * 2)
-                normal_canvas.reinit_camera(new_fov)
-            else:
-                normal_canvas.reinit_camera(fov)
-            normal_canvas.view_changed()
-            img = normal_canvas.render()
-            img = cv2.GaussianBlur(img,(int(init_factor//2 * 2 + 1), int(init_factor//2 * 2 + 1)), 0)
-            img = cv2.resize(img, (int(img.shape[1] / init_factor), int(img.shape[0] / init_factor)), interpolation=cv2.INTER_AREA)
-            img = img[anchor[0]:anchor[1], anchor[2]:anchor[3]]
-            img = img[int(border[0]):int(border[1]), int(border[2]):int(border[3])]
+    
+    stereos = []
+    for tp_id, tp in enumerate(get_sbs_eye_pos()):
+       rel_pose = np.linalg.inv(np.dot(tp, np.linalg.inv(ref_pose)))
+       img = render_frame(normal_canvas, rel_pose, fov, init_factor, anchor, border, config)
+       stereos.append(img[..., :3])
+    atop = 0; abuttom = img.shape[0] - img.shape[0] % 2; aleft = 0; aright = img.shape[1] - img.shape[1] % 2
+    crop_stereos = []
+    for stereo in stereos:
+        crop_stereos.append((stereo[atop:abuttom, aleft:aright, :3] * 1).astype(np.uint8))
+        stereos = crop_stereos
+    sbs = cv2.hconcat(stereos)
+    if isinstance(video_basename, list):
+        video_basename = video_basename[0]
+    cv2.imwrite(os.path.join(output_dir, video_basename + '.sbs.jpg'), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
 
-            if any(np.array(config['crop_border']) > 0.0):
-                H_c, W_c, _ = img.shape
-                o_t = int(H_c * config['crop_border'][0])
-                o_l = int(W_c * config['crop_border'][1])
-                o_b = int(H_c * config['crop_border'][2])
-                o_r = int(W_c * config['crop_border'][3])
-                img = img[o_t:H_c-o_b, o_l:W_c-o_r]
-                img = cv2.resize(img, (W_c, H_c), interpolation=cv2.INTER_CUBIC)
+    # for video_pose, video_traj_type in zip(videos_poses, video_traj_types):
+    #     stereos = []
+    #     for tp_id, tp in enumerate(video_pose):
+    #         rel_pose = np.linalg.inv(np.dot(tp, np.linalg.inv(ref_pose)))
+    
+    #         if 'dolly' in video_traj_type:
+    #             new_mean_loc_depth = mean_loc_depth - float(rel_pose[2, 3])
+    #             new_fov = float((np.arctan2(plane_width, np.array([np.abs(new_mean_loc_depth)])) * 180. / np.pi) * 2)
+    #             normal_canvas.reinit_camera(new_fov)
+    #         else:
+    #             new_fov=fov
+    #         img = render_frame(normal_canvas, rel_pose, new_fov, init_factor, anchor, border, config)
+    #         stereos.append(img[..., :3])
 
-            """
-            img = cv2.resize(img, (int(img.shape[1] / init_factor), int(img.shape[0] / init_factor)), interpolation=cv2.INTER_CUBIC)
-            img = img[anchor[0]:anchor[1], anchor[2]:anchor[3]]
-            img = img[int(border[0]):int(border[1]), int(border[2]):int(border[3])]
-
-            if config['crop_border'] is True:
-                top, buttom, left, right = find_largest_rect(img, bg_color=(128, 128, 128))
-                tops.append(top); buttoms.append(buttom); lefts.append(left); rights.append(right)
-            """
-            stereos.append(img[..., :3])
-            normal_canvas.translate(-rel_pose[:3,3])
-            normal_canvas.rotate(axis=axis, angle=-(angle*180)/np.pi)
-            normal_canvas.view_changed()
-        """
-        if config['crop_border'] is True:
-            atop, abuttom = min(max(tops), img.shape[0]//2 - 10), max(min(buttoms), img.shape[0]//2 + 10)
-            aleft, aright = min(max(lefts), img.shape[1]//2 - 10), max(min(rights), img.shape[1]//2 + 10)
-            atop -= atop % 2; abuttom -= abuttom % 2; aleft -= aleft % 2; aright -= aright % 2
-        else:
-            atop = 0; abuttom = img.shape[0] - img.shape[0] % 2; aleft = 0; aright = img.shape[1] - img.shape[1] % 2
-        """
-        atop = 0; abuttom = img.shape[0] - img.shape[0] % 2; aleft = 0; aright = img.shape[1] - img.shape[1] % 2
-        crop_stereos = []
-        for stereo in stereos:
-            crop_stereos.append((stereo[atop:abuttom, aleft:aright, :3] * 1).astype(np.uint8))
-            stereos = crop_stereos
-        clip = ImageSequenceClip(stereos, fps=config['fps'])
-        if isinstance(video_basename, list):
-            video_basename = video_basename[0]
-        clip.write_videofile(os.path.join(output_dir, video_basename + '_' + video_traj_type + '.mp4'), fps=config['fps'])
+    #     atop = 0; abuttom = img.shape[0] - img.shape[0] % 2; aleft = 0; aright = img.shape[1] - img.shape[1] % 2
+    #     crop_stereos = []
+    #     for stereo in stereos:
+    #         crop_stereos.append((stereo[atop:abuttom, aleft:aright, :3] * 1).astype(np.uint8))
+    #         stereos = crop_stereos
+    #     clip = ImageSequenceClip(stereos, fps=config['fps'])
+    #     if isinstance(video_basename, list):
+    #         video_basename = video_basename[0]
+    #     clip.write_videofile(os.path.join(output_dir, video_basename + '_' + video_traj_type + '.mp4'), fps=config['fps'])
 
 
 
