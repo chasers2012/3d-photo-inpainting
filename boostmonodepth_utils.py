@@ -45,13 +45,16 @@ def run_boostmonodepth(img_names, src_folder, depth_folder):
         write_depth(os.path.join(depth_folder, tgt_name.replace('.png', '')), depth)
 
 def clean_folder(folder, img_exts=['.png', '.jpg', '.npy']):
-
+    def files(base_dir, ext):
+        for i in glob.glob(os.path.join(base_dir, ext)):
+            yield i
     for img_ext in img_exts:
         paths_to_check = os.path.join(folder, f'*{img_ext}')
         if len(glob.glob(paths_to_check)) == 0:
             continue
         print(paths_to_check)
-        os.system(f'rm {paths_to_check}')
+        for i in files(folder, f'*{img_ext}'):
+            os.remove(i)
 
 def resize_depth(depth, width, height):
     """Resize numpy (or image read by imageio) depth map
